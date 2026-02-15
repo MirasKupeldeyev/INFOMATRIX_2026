@@ -1,0 +1,269 @@
+import os
+import cv2
+import timm
+import torch
+import random
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, roc_auc_score
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+
+class DeepFakeVideoDataset(Dataset):
+    def __init__(self, root_dir, transform=None, frames_per_video=16):
+        self.samples = []
+        self.transform = transform
+        self.frames_per_video = frames_per_video
+
+
+        self.video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')
+        # Define allowed image extensions
+        self.image_extensions = ('.jpg', '.png', '.jpeg')
+
+        for label, folder in enumerate(['real', 'fake']):
+            folder_path = os.path.join(root_dir, folder)
+            if not os.path.exists(folder_path):
+                print(f"Warning: Folder not found: {folder_path}. Skipping.")
+                continue
+
+            for file_name in os.listdir(folder_path):
+                file_path = os.path.join(folder_path, file_name)
+                # Filter out directories and only add valid video/image files
+                if os.path.isfile(file_path) and (file_path.lower().endswith(self.video_extensions) or file_path.lower().endswith(self.image_extensions)):
+                    self.samples.append(
+                        (file_path, label)
+                    )
+                else:
+                    print(f"Skipping non-video/image file or directory in {folder_path}: {file_name}")
+
+        if not self.samples:
+            print(f"ERROR: No valid video or image files found in {root_dir}. The dataset is EMPTY!")
+
+
+    def __len__(self):
+        return len(self.samples)
+
+    def extract_frames(self, video_path):
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+
+        if not cap.isOpened():
+            print(f"Warning: Could not open video file: {video_path}")
+            dummy_frame = Image.new('RGB', (224, 224), (0, 0, 0))
+            return [dummy_frame] * self.frames_per_video
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if total_frames == 0:
+            print(f"Warning: Video has 0 frames: {video_path}")
+            dummy_frame = Image.new('RGB', (224, 224), (0, 0, 0))
+            return [dummy_frame] * self.frames_per_video
+
+
+        if total_frames < 1: # if total_frames is 0 or negative
+            frame_indices = np.array([], dtype=int) # Empty array for linspace to avoid errors
+        else:
+            frame_indices = np.linspace(
+                0, total_frames - 1, self.frames_per_video, dtype=int
+            )
+
+
+        for idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = Image.fromarray(frame)
+                frames.append(frame)
+        cap.release()
+
+
+        if not frames:
+            print(f"Warning: No frames successfully read from video: {video_path}. Using dummy frames.")
+            dummy_frame = Image.new('RGB', (224, 224), (0, 0, 0))
+            return [dummy_frame] * self.frames_per_video
+
+        while len(frames) < self.frames_per_video:
+            dummy_frame = Image.new('RGB', (224, 224), (0, 0, 0))
+            frames.append(dummy_frame)
+
+        return frames
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+
+        if path.lower().endswith(self.image_extensions):
+            img = Image.open(path).convert("RGB")
+            if self.transform:
+                img = self.transform(img)
+            return img.unsqueeze(0), torch.tensor(label)
+
+
+        frames = self.extract_frames(path)
+
+
+        if not frames:
+            print(f"CRITICAL ERROR: extract_frames returned an EMPTY list for video: {path}. This indicates a bug in extract_frames logic.")
+            dummy_frame = Image.new('RGB', (224, 224), (0, 0, 0))
+            frames = [dummy_frame] * self.frames_per_video
+
+        if self.transform:
+            transformed_frames = []
+            for f in frames:
+                transformed_f = self.transform(f)
+                # Only append if the transformed result is a non-empty tensor
+                if transformed_f is not None and isinstance(transformed_f, torch.Tensor) and transformed_f.numel() > 0:
+                    transformed_frames.append(transformed_f)
+                else:
+                    print(f"WARNING: Transformation of a frame from {path} resulted in an invalid/empty tensor. Frame might be skipped.")
+            frames = transformed_frames
+
+
+        if not frames:
+            raise RuntimeError(f"FATAL: Frames list became EMPTY after transformations for video: {path}. Cannot stack.")
+
+        frames = torch.stack(frames)  # (T, C, H, W)
+        return frames, torch.tensor(label)
+
+train_transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(0.2,0.2,0.2,0.1),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],
+                         [0.229,0.224,0.225])
+])
+
+val_transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],
+                         [0.229,0.224,0.225])
+])
+
+model = timm.create_model(
+    "efficientnet_b3",
+    pretrained=True,
+    num_classes=2
+)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+
+train_dataset = DeepFakeVideoDataset(
+    "/content/data/train",
+    transform=train_transform,
+    frames_per_video=16
+)
+
+val_dataset = DeepFakeVideoDataset(
+    "/content/data/val",
+    transform=val_transform,
+    frames_per_video=16
+)
+
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
+
+criterion = torch.nn.CrossEntropyLoss()
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode="max", patience=2
+)
+
+best_auc = 0
+patience = 5
+counter = 0 
+epochs = 20
+
+for epoch in range(epochs):
+    # ---- TRAIN ----
+    model.train()
+    train_loss = 0
+
+    for frames, labels in tqdm(train_loader):
+        frames = frames.to(device)      # (B,T,C,H,W)
+        labels = labels.to(device)
+
+        B, T, C, H, W = frames.shape
+        frames = frames.view(B*T, C, H, W)
+
+        outputs = model(frames)
+        outputs = outputs.view(B, T, 2).mean(dim=1)  # ← усреднение
+
+        loss = criterion(outputs, labels)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+
+    # ---- VALIDATION ----
+    model.eval()
+    val_preds = []
+    val_probs = []
+    val_labels = []
+
+    with torch.no_grad():
+        for frames, labels in val_loader:
+            frames = frames.to(device)
+            B, T, C, H, W = frames.shape
+            frames = frames.view(B*T, C, H, W)
+
+            outputs = model(frames)
+            outputs = outputs.view(B, T, 2).mean(dim=1)
+
+            probs = torch.softmax(outputs, dim=1)
+
+            val_preds.extend(torch.argmax(probs,1).cpu().numpy())
+            val_probs.extend(probs[:,1].cpu().numpy())
+            val_labels.extend(labels.numpy())
+
+    acc = accuracy_score(val_labels, val_preds)
+    auc = roc_auc_score(val_labels, val_probs)
+
+    print(f"\nEpoch {epoch+1}")
+    print(f"Val Accuracy: {acc:.4f}")
+    print(f"Val ROC-AUC: {auc:.4f}")
+
+    scheduler.step(auc)
+
+    # Early stopping
+    if auc > best_auc:
+        best_auc = auc
+        counter = 0
+        torch.save(model.state_dict(), "best_model.pth")
+        print(" Model saved!")
+    else:
+        counter += 1
+        if counter >= patience:
+            print(" Early stopping")
+            break
+
+def predict_video(video_path, frames_per_video=32):
+    model.eval()
+
+    dataset = DeepFakeVideoDataset(
+        root_dir=".",
+        transform=val_transform,
+        frames_per_video=frames_per_video
+    )
+
+    frames = dataset.extract_frames(video_path)
+    frames = [val_transform(f) for f in frames]
+    frames = torch.stack(frames).to(device)
+
+    with torch.no_grad():
+        outputs = model(frames)
+        probs = torch.softmax(outputs, dim=1)
+        mean_prob = probs[:,1].mean().item()
+
+    label = "FAKE" if mean_prob > 0.5 else "REAL"
+    confidence = mean_prob * 100
+
+    print(f"Prediction: {label}")
+    print(f"Confidence: {confidence:.2f}%")
+
+    return label, confidence
